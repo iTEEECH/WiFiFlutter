@@ -1,15 +1,24 @@
 import Flutter
+import CoreLocation
 import UIKit
 import SystemConfiguration.CaptiveNetwork
 import NetworkExtension
 
-public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
+public class SwiftWifiIotPlugin: NSObject, FlutterPlugin, CLLocationManagerDelegate {
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "wifi_iot", binaryMessenger: registrar.messenger())
         let instance = SwiftWifiIotPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
-    
+
+    private let locationManager = CLLocationManager()
+    private var ssidResult: ((String?) -> Void)?
+
+    public override init() {
+           super.init()
+           locationManager.delegate = self
+    }
+
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch (call.method) {
             /// Stand Alone
@@ -103,69 +112,66 @@ public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
         result(FlutterMethodNotImplemented)
     }
 
-    private func forceWifiUsage(call: FlutterMethodCall, result: FlutterResult) {
-        let arguments = call.arguments
-        let useWifi = (arguments as! [String : Bool])["useWifi"]
-        print("Forcing WiFi usage : %s", ((useWifi ?? false) ? "Use WiFi" : "Use 3G/4G Data"))
-        if #available(iOS 14.0, *) {
-            if(useWifi ?? false){
-                // trigger access for local network
-                triggerLocalNetworkPrivacyAlert();
+       private func forceWifiUsage(call: FlutterMethodCall, result: FlutterResult) {
+            guard let arguments = call.arguments,
+            let useWifi = (arguments as! [String : Bool])["useWifi"] else {
+                result(false)
+                return
+            }
+            print("Forcing WiFi usage: \(useWifi ? "Use WiFi" : "Use 3G/4G Data")")
+            if useWifi {
+                triggerLocalNetworkPrivacyAlert()
             }
             result(true)
-        } else {
-            result(FlutterMethodNotImplemented)
-        }
-    }
+       }
 
-    private func connect(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        let sSSID = (call.arguments as? [String : AnyObject])?["ssid"] as! String
-        let _ = (call.arguments as? [String : AnyObject])?["bssid"] as? String? // not used
-        let sPassword = (call.arguments as? [String : AnyObject])?["password"] as? String? ?? nil
-        let bJoinOnce = (call.arguments as? [String : AnyObject])?["join_once"] as! Bool?
-        let sSecurity = (call.arguments as? [String : AnyObject])?["security"] as! String?
+       private func connect(call: FlutterMethodCall, result: @escaping FlutterResult) {
+           let sSSID = (call.arguments as? [String : AnyObject])?["ssid"] as! String
+           let sPassword = (call.arguments as? [String : AnyObject])?["password"] as? String? ?? nil
+           let bJoinOnce = (call.arguments as? [String : AnyObject])?["join_once"] as! Bool?
+           let sSecurity = (call.arguments as? [String : AnyObject])?["security"] as! String?
 
-        if #available(iOS 11.0, *) {
-            let configuration = initHotspotConfiguration(ssid: sSSID, passphrase: sPassword, security: sSecurity)
-            configuration.joinOnce = bJoinOnce ?? false
 
-            NEHotspotConfigurationManager.shared.apply(configuration) { [weak self] (error) in
-                guard let this = self else {
-                    print("WiFi network not found")
-                    result(false)
-                    return
-                }
-                this.getSSID { (connectedSSID) -> () in
-                    if (error != nil) {
-                        if (error?.localizedDescription == "already associated.") {
-                            print("Connected to '\(connectedSSID ?? "<Unknown Network>")'")
-                            result(true)
-                        } else {
-                            print("Not Connected")
-                            result(false)
-                        }
-                    } else if let connectedSSID = connectedSSID {
-                        print("Connected to " + connectedSSID)
-                        // Emit result of [isConnected] by checking if targetSSID is the same as connectedSSID.
-                        result(sSSID == connectedSSID)
-                    } else {
-                        print("WiFi network not found")
-                        result(false)
-                    }
-                }
-            }
-        } else {
-            print("Not Connected")
-            result(nil)
-            return
-        }
-    }
+               let configuration = initHotspotConfiguration(ssid: sSSID, passphrase: sPassword, security: sSecurity)
+               configuration.joinOnce = bJoinOnce ?? false
+
+               NEHotspotConfigurationManager.shared.apply(configuration) { (error) in
+                   if let error = error as NSError? {
+                       switch error.code {
+                       case NEHotspotConfigurationError.alreadyAssociated.rawValue:
+                           print("Already connected to '\(sSSID)'.")
+                           result(true)
+                       case NEHotspotConfigurationError.invalid.rawValue:
+                           print("Code invalid.")
+                           result(false)
+                       case NEHotspotConfigurationError.invalidSSID.rawValue:
+                           print("SSID invalid.")
+                           result(false)
+                       case NEHotspotConfigurationError.userDenied.rawValue:
+                           print("User denied connection.")
+                           result(false)
+                       default:
+                           // Handle other non-NEHotspotConfigurationError errors
+                           if error.localizedDescription == "already associated." {
+                               print("Already connected to '\(sSSID)'")
+                               result(true)
+                           } else {
+                               print("Connection failed: \(error.localizedDescription)")
+                               result(false)
+                           }
+                       }
+                   } else {
+                       // No error means successful connection
+                       print("Successfully connected to '\(sSSID)'")
+                       result(true)
+                   }
+               }
+       }
 
     private func findAndConnect(call: FlutterMethodCall, result: @escaping FlutterResult) {
         result(FlutterMethodNotImplemented)
     }
 
-    @available(iOS 11.0, *)
     private func initHotspotConfiguration(ssid: String, passphrase: String?, security: String? = nil) -> NEHotspotConfiguration {
         switch security?.uppercased() {
             case "WPA":
@@ -178,13 +184,8 @@ public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
     }
 
     private func isEnabled(result: @escaping FlutterResult) {
-        // For now..
         getSSID { (sSSID) in
-            if (sSSID != nil) {
-                result(true)
-            } else {
-                result(nil)
-            }
+            result(sSSID != nil)
         }
     }
 
@@ -200,70 +201,93 @@ public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
     }
 
     private func isConnected(result: @escaping FlutterResult) {
-        // For now..
         getSSID { (sSSID) in
-            if (sSSID != nil) {
-                result(true)
-            } else {
-                result(false)
-            }
+            result(sSSID != nil)
         }
     }
 
     private func disconnect(result: @escaping FlutterResult) {
-        if #available(iOS 11.0, *) {
-            getSSID { (sSSID) in
-                if (sSSID != nil) {
-                    print("Trying to disconnect from '\(sSSID!)'")
-                    NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: sSSID ?? "")
-                    result(true)
-                } else {
-                    print("Not connected to a network")
-                    result(false)
-                }
+        getSSID { sSSID in
+            guard let sSSID = sSSID else {
+                print("Not connected to a network")
+                result(false)
+                return
             }
-        } else {
-            print("disconnect not available on this iOS version")
-            result(nil)
+
+            print("Disconnecting from '\(sSSID)'")
+            NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: sSSID)
+            result(true)
         }
     }
 
     private func getSSID(result: @escaping (String?) -> ()) {
-        if #available(iOS 14.0, *) {
-            NEHotspotNetwork.fetchCurrent(completionHandler: { currentNetwork in
-                result(currentNetwork?.ssid);
-            })
-        } else {
-            if let interfaces = CNCopySupportedInterfaces() as NSArray? {
-                for interface in interfaces {
-                    if let interfaceInfo = CNCopyCurrentNetworkInfo(interface as! CFString) as NSDictionary? {
-                        result(interfaceInfo[kCNNetworkInfoKeySSID as String] as? String)
-                        return
+        self.ssidResult = result
+
+            switch locationManager.authorizationStatus {
+            case .notDetermined:
+                locationManager.requestWhenInUseAuthorization()
+            case .authorizedWhenInUse, .authorizedAlways:
+                locationManager.requestTemporaryFullAccuracyAuthorization(
+                    withPurposeKey: "WiFiSSID"
+                ) { error in
+                    if let error = error {
+                         print("Error was occurred during location: \(error)")
                     }
+                    self.fetchSSID(result: result)
                 }
+            default:
+                print("Location permission denied")
+                result(nil)
             }
-            result(nil)
+    }
+
+    public func locationManager(_ manager: CLLocationManager,
+                              didChangeAuthorization status: CLAuthorizationStatus) {
+            switch status {
+            case .authorizedWhenInUse, .authorizedAlways:
+                locationManager.requestTemporaryFullAccuracyAuthorization(
+                    withPurposeKey: "WiFiSSID"
+                ) { error in
+                    if let error = error {
+                        print("Error was occurred during location: \(error)")
+                    }
+                    self.fetchSSID(result: self.ssidResult ?? { _ in })
+                }
+            default:
+                ssidResult?(nil)
+                ssidResult = nil
+            }
+    }
+
+    public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            locationManager.requestTemporaryFullAccuracyAuthorization(
+                withPurposeKey: "WiFiSSID"
+            ) { error in
+                if let error = error {
+                    print("Error requesting precise location: \(error)")
+                }
+                self.fetchSSID(result: self.ssidResult ?? { _ in })
+            }
+        default:
+            ssidResult?(nil)
+            ssidResult = nil
+        }
+    }
+
+    private func fetchSSID(result: @escaping (String?) -> ()) {
+        NEHotspotNetwork.fetchCurrent { network in
+            result(network?.ssid)
         }
     }
 
     private func getBSSID(result: @escaping (String?) -> ()) {
-        if #available(iOS 14.0, *) {
-            NEHotspotNetwork.fetchCurrent(completionHandler: { currentNetwork in
-                result(currentNetwork?.bssid);
-            })
-        } else {
-            if let interfaces = CNCopySupportedInterfaces() as NSArray? {
-                for interface in interfaces {
-                    if let interfaceInfo = CNCopyCurrentNetworkInfo(interface as! CFString) as NSDictionary? {
-                        result(interfaceInfo[kCNNetworkInfoKeyBSSID as String] as? String)
-                        return
-                    }
-                }
-            }
-            result(nil)
-        }
+         NEHotspotNetwork.fetchCurrent { network in
+            result(network?.bssid)
+         }
     }
-    
+
     private func getCurrentSignalStrength(result: FlutterResult) {
         result(FlutterMethodNotImplemented)
     }
@@ -276,7 +300,7 @@ public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
         guard let interface = getNetworkInterface(family: AF_INET) else {
             return result(nil)
         }
-        
+
         var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
         getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
                     &hostname, socklen_t(hostname.count),
@@ -284,7 +308,7 @@ public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
 
         result(String(cString: hostname))
     }
-    
+
     private func getNetworkInterface(family: Int32) -> ifaddrs? {
         var ifaddr : UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return nil }
@@ -309,20 +333,15 @@ public class SwiftWifiIotPlugin: NSObject, FlutterPlugin {
             print("No prefix SSID was given!")
             result(nil)
         }
-        
-        if #available(iOS 11.0, *) {
-            NEHotspotConfigurationManager.shared.getConfiguredSSIDs { (htSSID) in
-                for sIncSSID in htSSID {
-                    if (sPrefixSSID != "" && sIncSSID.hasPrefix(sPrefixSSID)) {
-                        NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: sIncSSID)
-                    }
+
+        NEHotspotConfigurationManager.shared.getConfiguredSSIDs { (htSSID) in
+            for sIncSSID in htSSID {
+                if (sPrefixSSID != "" && sIncSSID.hasPrefix(sPrefixSSID)) {
+                    NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: sIncSSID)
                 }
             }
-            result(true)
-        } else {
-            print("Not removed")
-            result(nil)
         }
+        result(true)
     }
 
     private func isRegisteredWifiNetwork(call: FlutterMethodCall, result: FlutterResult) {
